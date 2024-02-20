@@ -8,6 +8,8 @@
 #include <musa.h>
 #include <musa_runtime_api.h>
 
+// Fast 4-way parallel radix sorting on GPUs
+//
 // https://web.archive.org/web/20221012085306/https://vgc.poly.edu/~csilva/papers/cgf.pdf
 //
 // Input data:   [1 2 0 3] [0 1 1 0] [3 3 3 2] [1 2 2 0] [2 0 0 2]
@@ -149,7 +151,7 @@ void ComputeBlockSums_CPU(int* in, int* out, int num_blocks) {
     }
 }
 
-__global__ void Shuffle(int* in, int* out, int N, int shift_right, int* local_block_sums, int* global_block_sums) {
+__global__ void Shuffle(int* keys_in, int* keys_out, int* values_in, int* values_out, int N, int shift_right, int* local_block_sums, int* global_block_sums) {
     const int tidx = threadIdx.x + blockDim.x * blockIdx.x;
     const int nthds = blockDim.x * gridDim.x;
     const int num_blocks = (N-1) / blockDim.x + 1;
@@ -161,21 +163,22 @@ __global__ void Shuffle(int* in, int* out, int N, int shift_right, int* local_bl
     offsets123[3] = global_block_sums[num_blocks*3-1] + offsets123[2];
 
     for (int i=blockIdx.x * blockDim.x, bidx=blockIdx.x; i<N; i+=nthds, bidx+=gridDim.x) {
-        int elt = (in[i+threadIdx.x] >> shift_right) & 3;
+        int elt = (keys_in[i+threadIdx.x] >> shift_right) & 3;
         for (int bmask=0; bmask<4; bmask++) {
             if (i + threadIdx.x < N) {
                 if (elt == bmask) {
                     const int lbs = local_block_sums[blockDim.x * bidx + threadIdx.x];
                     int goffset = (bidx > 0) ? global_block_sums[num_blocks * bmask + bidx - 1] : 0;
                     goffset += offsets123[bmask];
-                    out[goffset + lbs] = in[i+threadIdx.x];
+                    keys_out[goffset + lbs] = keys_in[i+threadIdx.x];
+                    values_out[goffset+lbs] = values_in[i+threadIdx.x];
                 }
             }
         }
     }
 }
 
-void Shuffle_CPU(int* in, int* out, int N, int shift_right, int* local_block_sums, int* global_block_sums, int NT) {
+void Shuffle_CPU(int* keys_in, int* keys_out, int* values_in, int* values_out, int N, int shift_right, int* local_block_sums, int* global_block_sums, int NT) {
     const int num_blocks = (N-1) / NT + 1;
     int offsets123[4];
     offsets123[0] = 0;
@@ -186,13 +189,14 @@ void Shuffle_CPU(int* in, int* out, int N, int shift_right, int* local_block_sum
     for (int bidx=0, i=bidx*NT; i<N; bidx++, i+=NT) {
         for (int bmask=0; bmask<4; bmask++) {
             for (int tidx=0; tidx<NT; tidx++) {
-                int elt = (in[i+tidx] >> shift_right) & 3;
+                int elt = (keys_in[i+tidx] >> shift_right) & 3;
                 if (i+tidx < N) {
                     if (elt == bmask) {
                         const int lbs = local_block_sums[bidx * NT + tidx];
                         int goffset = (bidx > 0) ? global_block_sums[num_blocks * bmask + bidx - 1] : 0;
                         goffset += offsets123[bmask];
-                        out[goffset + lbs] = in[i + tidx];
+                        keys_out[goffset + lbs] = keys_in[i + tidx];
+                        values_out[goffset+lbs] = values_in[i+tidx];
                     }
                 }
             }
@@ -201,7 +205,7 @@ void Shuffle_CPU(int* in, int* out, int N, int shift_right, int* local_block_sum
 }
 
 static const bool VERBOSE = false;
-static const bool CHECK_RESULTS = false;
+static const bool CHECK_RESULTS = true;
 
 float DeltaMillis(
         const std::chrono::steady_clock::time_point& t1,
@@ -210,7 +214,7 @@ float DeltaMillis(
     return (std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()) * 0.001f;
 };
 
-//#define EXAMPLE_DATA
+#define EXAMPLE_DATA
 
 int main() {
 #ifdef EXAMPLE_DATA
@@ -224,21 +228,28 @@ int main() {
 #endif
     int* h_dbg_out = new int[N], *d_dbg_out;
     musaMalloc(&d_dbg_out, sizeof(int)*N);
-    int* h_in = new int[N], *d_in;
-    musaMalloc(&d_in,  sizeof(int)*N);
-    int* h_out = new int[N], *d_out;
-    int* h_out1 = new int[N];
-    musaMalloc(&d_out, sizeof(int)*N);
+    int* h_keys_in = new int[N], *d_keys_in;
+    int* h_values_in = new int[N], *d_values_in;
+    musaMalloc(&d_keys_in,  sizeof(int)*N);
+    musaMalloc(&d_values_in, sizeof(int)*N);
+    int* h_keys_out = new int[N], *d_keys_out;
+    int* h_keys_out1 = new int[N];
+    musaMalloc(&d_keys_out, sizeof(int)*N);
+    int* h_values_out = new int[N], *d_values_out;
+    int* h_values_out1 = new int[N];
+    musaMalloc(&d_values_out, sizeof(int)*N);
     
 #ifdef EXAMPLE_DATA
-    int data[] = { 1,2,0,3, 0,1,1,0, 3,3,3,2, 1,2,2,0, 2,0,0,2, 1,2,3,2, 1,2,3,2, 2,3,2,1 };
+    int data[]   = { 1,2,0,3, 0,1,1,0, 3,3,3,2,   1,2,2,0,     2,0,0,2,     1,2,3,2,     1,2,3,2,     2,3,2,1     };
+    int values[] = { 0,1,2,3, 4,5,6,7, 8,9,10,11, 12,13,14,15, 16,17,18,19, 20,21,22,23, 24,25,26,27, 28,29,30,31 };
+    memcpy(h_keys_in, data, sizeof(int)*N);
+    memcpy(h_values_in, values, sizeof(int)*N);
 #else
-    int* data = new int[N];
     for (int i=0; i<N; i++) {
-        data[i] = rand();
+        h_keys_in[i]   = rand();
+        h_values_in[i] = i;
     }
 #endif
-    memcpy(h_in, data, sizeof(int)*N);
 
     const int num_blocks = (N-1) / NT + 1;
     int* d_scratch;
@@ -254,7 +265,8 @@ int main() {
     int* h_local_block_sums1 = new int[num_blocks * NT];
     int* h_global_block_sums1 = new int[4 * num_blocks];
 
-    musaMemcpy(d_in, h_in, sizeof(int)*N, musaMemcpyHostToDevice);
+    musaMemcpy(d_keys_in, h_keys_in, sizeof(int)*N, musaMemcpyHostToDevice);
+    musaMemcpy(d_values_in, h_values_in, sizeof(int)*N, musaMemcpyHostToDevice);
     auto t0 = std::chrono::steady_clock::now();
 
 #ifdef EXAMPLE_DATA
@@ -263,7 +275,7 @@ int main() {
     for (int shift_right = 0; shift_right < 32; shift_right += 2)
 #endif
     {
-        CountBitPatterns<<<NB, NT, sizeof(short)*NT*3>>>(d_in, N, shift_right, d_local_block_sums, d_bit_patterns);
+        CountBitPatterns<<<NB, NT, sizeof(short)*NT*3>>>(d_keys_in, N, shift_right, d_local_block_sums, d_bit_patterns);
         
         if (VERBOSE) {
             musaMemcpy(h_bit_patterns, d_bit_patterns, sizeof(int)*4*num_blocks, musaMemcpyDeviceToHost);
@@ -276,7 +288,7 @@ int main() {
                 printf("\n");
             }
             musaMemcpy(h_local_block_sums, d_local_block_sums, sizeof(int)*NT*num_blocks, musaMemcpyDeviceToHost);
-            CountBitPatterns_CPU(h_in, N, shift_right, h_local_block_sums1, NT);
+            CountBitPatterns_CPU(h_keys_in, N, shift_right, h_local_block_sums1, NT);
             printf("local block sums:\n");
             for (int i=0; i<num_blocks; i++) {
                 printf("Block %d:", i);
@@ -292,8 +304,8 @@ int main() {
         }
 
         if (CHECK_RESULTS) {
-            musaMemcpy(h_in, d_in, sizeof(int)*N, musaMemcpyDeviceToHost);
-            CountBitPatterns_CPU(h_in, N, shift_right, h_local_block_sums1, NT);
+            musaMemcpy(h_keys_in, d_keys_in, sizeof(int)*N, musaMemcpyDeviceToHost);
+            CountBitPatterns_CPU(h_keys_in, N, shift_right, h_local_block_sums1, NT);
             musaMemcpy(h_local_block_sums, d_local_block_sums, sizeof(int)*NT*num_blocks, musaMemcpyDeviceToHost);
             for (int i=0; i<num_blocks; i++) {
                 for (int j=0; j<NT && NT*i+j<N; j++) {
@@ -340,10 +352,10 @@ int main() {
             }
         }
 
-        Shuffle<<<NB, NT>>>(d_in, d_out, N, shift_right, d_local_block_sums, d_global_block_sums);
+        Shuffle<<<NB, NT>>>(d_keys_in, d_keys_out, d_values_in, d_values_out, N, shift_right, d_local_block_sums, d_global_block_sums);
 
         if (VERBOSE) {
-            musaMemcpy(h_dbg_out, d_out, sizeof(int)*N, musaMemcpyDeviceToHost);
+            musaMemcpy(h_dbg_out, d_keys_out, sizeof(int)*N, musaMemcpyDeviceToHost);
             printf("h_dbg_out:");
             for (int i=0; i<N; i++) { printf(" %d", h_dbg_out[i]); }
             printf("\n");
@@ -351,19 +363,24 @@ int main() {
 
         if (CHECK_RESULTS) {
             musaDeviceSynchronize();
-            Shuffle_CPU(h_in, h_out1, N, shift_right, h_local_block_sums1, h_global_block_sums1, NT);
-            musaMemcpy(h_out, d_out, sizeof(int)*N, musaMemcpyDeviceToHost);
-            bool ok = true;
+            Shuffle_CPU(h_keys_in, h_keys_out1, h_values_in, h_values_out1, N, shift_right, h_local_block_sums1, h_global_block_sums1, NT);
+            musaMemcpy(h_keys_out, d_keys_out, sizeof(int)*N, musaMemcpyDeviceToHost);
+            musaMemcpy(h_values_out, d_values_out, sizeof(int)*N, musaMemcpyDeviceToHost);
             for (int i=0; i<N; i++) {
-                if (h_out[i] != h_out1[i]) {
-                    printf("shift_right=%d, Shuffle results [%d] not matched: %d vs %d\n",
-                        shift_right, i, h_out[i], h_out1[i]);
-                    ok = false;
+                if (h_keys_out[i] != h_keys_out1[i]) {
+                    printf("shift_right=%d, Shuffle, keys [%d] not matched: %d vs %d\n",
+                        shift_right, i, h_keys_out[i], h_keys_out1[i]);
+                }
+                if (h_values_out[i] != h_values_out1[i]) {
+                    printf("shift_right=%d, Shuffle, value [%d] not matched: %d vs %d\n",
+                        shift_right, i, h_values_out[i], h_values_out1[i]);
                 }
             }
+            memcpy(h_values_in, h_values_out1, sizeof(int)*N);
         }
 
-        std::swap(d_in, d_out);
+        std::swap(d_keys_in,   d_keys_out);
+        std::swap(d_values_in, d_values_out);
     }
 
     musaDeviceSynchronize();
@@ -373,10 +390,10 @@ int main() {
 
     // Check result
     bool ok = true;
-    musaMemcpy(h_out, d_in, sizeof(int)*N, musaMemcpyDeviceToHost);
+    musaMemcpy(h_keys_out, d_keys_in, sizeof(int)*N, musaMemcpyDeviceToHost);
     for (int i=0; i<N-1; i++) {
-        if (h_out[i] > h_out[i+1]) {
-            printf("[%d]=%d, [%d]=%d\n", i, h_out[i], i+1, h_out[i+1]);
+        if (h_keys_out[i] > h_keys_out[i+1]) {
+            printf("[%d]=%d, [%d]=%d\n", i, h_keys_out[i], i+1, h_keys_out[i+1]);
             ok = false;
         }
     }
