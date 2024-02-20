@@ -9,3 +9,7 @@ find_package(MUSA REQUIRED)
 musa_add_executable(deviceProperties deviceProperties.mu)
 target_link_libraries(deviceProperties musa musart)
 target_link_directories(deviceProperties PUBLIC /usr/local/musa/lib)
+
+musa_add_executable(radixSort radixSort.mu)
+target_link_libraries(radixSort musa musart)
+target_link_directories(radixSort PUBLIC /usr/local/musa/lib)
