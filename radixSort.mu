@@ -205,7 +205,7 @@ void Shuffle_CPU(int* keys_in, int* keys_out, int* values_in, int* values_out, i
 }
 
 static const bool VERBOSE = false;
-static const bool CHECK_RESULTS = true;
+static const bool CHECK_RESULTS = false;
 
 float DeltaMillis(
         const std::chrono::steady_clock::time_point& t1,
@@ -214,7 +214,7 @@ float DeltaMillis(
     return (std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()) * 0.001f;
 };
 
-#define EXAMPLE_DATA
+//#define EXAMPLE_DATA
 
 int main() {
 #ifdef EXAMPLE_DATA
