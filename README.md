@@ -18,7 +18,7 @@ Similar to CUDA practices but done on a Moore Threads device.
 
 2. Follow [this link](https://developer.mthreads.com/sdk/download/musa?equipment=&os=&driverVersion=&version=) to download MUSA toolkit 1.4.1 (might need to register an MThreads developer account)
 
-After installation you should have ``.
+After installation you should have `/usr/local/musa`.
 
 ## Contents
 
